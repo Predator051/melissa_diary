@@ -2,6 +2,7 @@
 
 Модель: кожна подія відкриває стан (годування / сон / не спить), який триває
 до наступної події. Тому тривалість рядка = час до наступного запису.
+Нічний сон рахується окремо — див. night.py.
 """
 from __future__ import annotations
 
@@ -10,7 +11,10 @@ from dataclasses import dataclass
 from datetime import date, datetime, time as dtime, timedelta
 
 from .. import db, models
+from . import night as night_service
 from .timeparse import human_date, human_duration, now, plural, short_date
+
+Interval = tuple[datetime, datetime]
 
 
 @dataclass
@@ -71,50 +75,100 @@ def segments(day: date) -> list[Segment]:
     return result
 
 
+def _subtract(intervals: list[Interval], spans: list[Interval]) -> list[Interval]:
+    """Прибрати з відрізків усе, що потрапляє в spans (проміжки ночі)."""
+    result: list[Interval] = []
+    for start, end in intervals:
+        pieces = [(start, end)]
+        for span_start, span_end in spans:
+            remaining: list[Interval] = []
+            for piece_start, piece_end in pieces:
+                if span_end <= piece_start or span_start >= piece_end:
+                    remaining.append((piece_start, piece_end))
+                    continue
+                if piece_start < span_start:
+                    remaining.append((piece_start, span_start))
+                if span_end < piece_end:
+                    remaining.append((span_end, piece_end))
+            pieces = remaining
+        result.extend(piece for piece in pieces if piece[1] > piece[0])
+    return result
+
+
 def totals(day: date) -> dict:
-    """Підсумки доби: сон, годування, кількості."""
+    """Підсумки доби: денний сон окремо, нічний окремо."""
+    morning_night = night_service.night_for_morning(day)
+    evening_night = night_service.night_started_on(day)
+    spans = night_service.spans_for_day(day)
+
+    sleep_intervals: list[Interval] = []
     data = {
-        "sleep": timedelta(),
         "feed": timedelta(),
-        "awake": timedelta(),
         "feeds": 0,
         "left": 0,
         "right": 0,
-        "sleeps": 0,
-        "longest_sleep": timedelta(),
+        "night_feeds": 0,
+        "day_sleep": timedelta(),
+        "naps": 0,
+        "longest_nap": timedelta(),
+        "night": morning_night,
+        "evening_night": evening_night,
     }
+
     for seg in segments(day):
         if seg.state == models.ASLEEP:
-            data["sleep"] += seg.duration
-            data["longest_sleep"] = max(data["longest_sleep"], seg.duration)
+            sleep_intervals.append((seg.start, seg.end))
         elif seg.state == models.FEED:
             data["feed"] += seg.duration
-        else:
-            data["awake"] += seg.duration
         if seg.carried:
             continue
-        if seg.kind == models.FEED_LEFT:
+        if seg.kind in (models.FEED_LEFT, models.FEED_RIGHT):
             data["feeds"] += 1
-            data["left"] += 1
-        elif seg.kind == models.FEED_RIGHT:
-            data["feeds"] += 1
-            data["right"] += 1
-        elif seg.kind == models.SLEEP:
-            data["sleeps"] += 1
+            data["left" if seg.kind == models.FEED_LEFT else "right"] += 1
+            if morning_night is not None and morning_night.start <= seg.start < morning_night.span_end:
+                data["night_feeds"] += 1
+
+    day_sleep = _subtract(sleep_intervals, spans)
+    data["day_sleep"] = sum((end - start for start, end in day_sleep), timedelta())
+    data["naps"] = len(day_sleep)
+    data["longest_nap"] = max((end - start for start, end in day_sleep), default=timedelta())
     return data
+
+
+def _night_headline(day: date, night: night_service.Night) -> str:
+    started = night.start.strftime("%H:%M")
+    if night.start.date() != day:
+        started += f" ({night.start.strftime('%d.%m')})"
+    wakings = (
+        f" · прокидалась {night.wakings} {plural(night.wakings, ('раз', 'рази', 'разів'))}"
+        if night.wakings else ""
+    )
+    if night.ongoing:
+        return f"🌙 <i>Ніч триває з {started}{wakings}</i>"
+    if night.wake_missing:
+        return f"🌙 <i>Ніч: {started} → підйом не записаний{wakings}</i>"
+    return f"🌙 <i>Ніч: {started} → {night.span_end.strftime('%H:%M')}{wakings}</i>"
 
 
 def format_day(day: date, *, highlight_id: int | None = None) -> str:
     segs = segments(day)
-    header = f"📅 <b>{human_date(day)}</b>"
-    if not segs:
-        return f"{header}\n\nЗаписів немає."
+    t = totals(day)
+    night = t["night"]
 
-    lines = [header, ""]
+    lines = [f"📅 <b>{human_date(day)}</b>"]
+    if night is not None:
+        lines.append(_night_headline(day, night))
+    if not segs:
+        lines += ["", "Записів немає."]
+        return "\n".join(lines)
+    lines.append("")
+
     for seg in segs:
         duration = human_duration(seg.duration)
         if seg.carried:
-            since = db.parse(seg.event['ts']).strftime("%H:%M")
+            if night is not None and night.start <= db.parse(seg.event["ts"]) < night.span_end:
+                continue  # ця подія вже описана рядком про ніч
+            since = db.parse(seg.event["ts"]).strftime("%H:%M")
             lines.append(
                 f"🌙 <i>з ночі: {models.STATE_LABEL[seg.state]} з {since} — {duration}</i>"
             )
@@ -129,20 +183,44 @@ def format_day(day: date, *, highlight_id: int | None = None) -> str:
             f"{models.SHORT[seg.kind]} — <i>{tail}</i>{mark}"
         )
 
-    t = totals(day)
     lines += ["", "— <b>Разом за добу</b> —"]
-    lines.append(f"🍼 Годувань: {t['feeds']} (ліва {t['left']} / права {t['right']})")
+    feeds_line = f"🍼 Годувань: {t['feeds']} (ліва {t['left']} / права {t['right']})"
+    if t["night_feeds"]:
+        feeds_line += f", з них уночі {t['night_feeds']}"
+    lines.append(feeds_line)
     if t["feed"]:
         lines.append(f"⏱ Часу на грудях: {human_duration(t['feed'])}")
-    if not t["sleep"]:
-        lines.append("😴 Сон: не записаний")
-    if t["sleep"]:
-        sleep_line = f"😴 Сон: {human_duration(t['sleep'])}"
-        if t["sleeps"]:
-            sleep_line += f" за {t['sleeps']} {plural(t['sleeps'], ('раз', 'рази', 'разів'))}"
-        lines.append(sleep_line)
-    if t["longest_sleep"]:
-        lines.append(f"🌙 Найдовший сон: {human_duration(t['longest_sleep'])}")
+
+    if night is not None:
+        suffix = " (триває)" if night.ongoing else ""
+        lines.append(f"🌙 Нічний сон: {human_duration(night.total)}{suffix}")
+    else:
+        lines.append("🌙 Нічний сон: не записаний")
+
+    if t["day_sleep"]:
+        day_line = (
+            f"😴 Денний сон: {human_duration(t['day_sleep'])} за {t['naps']} "
+            f"{plural(t['naps'], ('раз', 'рази', 'разів'))}"
+        )
+        lines.append(day_line)
+        if t["naps"] > 1:
+            lines.append(f"⭐ Найдовший денний сон: {human_duration(t['longest_nap'])}")
+    else:
+        lines.append("😴 Денний сон: не записаний")
+
+    evening = t["evening_night"]
+    if evening is not None:
+        if evening.ongoing:
+            lines.append(
+                f"\n🌙 Вкладена о {evening.start.strftime('%H:%M')} — "
+                f"ніч триває {human_duration(evening.total)}"
+            )
+        else:
+            morning = (day + timedelta(days=1)).strftime("%d.%m")
+            lines.append(
+                f"\n🌙 Вкладена о {evening.start.strftime('%H:%M')} — "
+                f"ця ніч у зведенні за {morning}"
+            )
 
     if day == now().date():
         last_feed = _last_of(day, (models.FEED_LEFT, models.FEED_RIGHT))
@@ -163,27 +241,33 @@ def _last_of(day: date, kinds: tuple[str, ...]) -> datetime | None:
 def format_week(end_day: date | None = None) -> str:
     end_day = end_day or now().date()
     lines = ["📊 <b>Останні 7 днів</b>", ""]
-    week = {"feeds": 0, "sleep": timedelta(), "days": 0}
+    week = {"feeds": 0, "day_sleep": timedelta(), "night_sleep": timedelta(),
+            "days": 0, "nights": 0}
+
     for offset in range(6, -1, -1):
         day = end_day - timedelta(days=offset)
         t = totals(day)
-        if not t["feeds"] and not t["sleep"]:
+        night = t["night"]
+        night_total = night.total if night is not None else timedelta()
+        if not t["feeds"] and not t["day_sleep"] and not night_total:
             lines.append(f"<b>{short_date(day)}</b> — записів немає")
             continue
         week["feeds"] += t["feeds"]
-        week["sleep"] += t["sleep"]
+        week["day_sleep"] += t["day_sleep"]
         week["days"] += 1
+        if night is not None:
+            week["night_sleep"] += night_total
+            week["nights"] += 1
         lines.append(
             f"<b>{short_date(day)}</b> — 🍼 {t['feeds']} ({t['left']}/{t['right']})"
-            f" · 😴 {human_duration(t['sleep'])}"
+            f" · 🌙 {human_duration(night_total) if night_total else '—'}"
+            f" · 😴 {human_duration(t['day_sleep']) if t['day_sleep'] else '—'}"
         )
+
     if week["days"]:
-        avg_feeds = week["feeds"] / week["days"]
-        avg_sleep = week["sleep"] / week["days"]
-        lines += [
-            "",
-            "— <b>У середньому за день</b> —",
-            f"🍼 Годувань: {avg_feeds:.1f}",
-            f"😴 Сон: {human_duration(avg_sleep)}",
-        ]
+        lines += ["", "— <b>У середньому за день</b> —",
+                  f"🍼 Годувань: {week['feeds'] / week['days']:.1f}"]
+        if week["nights"]:
+            lines.append(f"🌙 Нічний сон: {human_duration(week['night_sleep'] / week['nights'])}")
+        lines.append(f"😴 Денний сон: {human_duration(week['day_sleep'] / week['days'])}")
     return "\n".join(lines)

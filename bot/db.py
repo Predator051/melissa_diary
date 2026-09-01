@@ -95,9 +95,22 @@ def events_between(start: datetime, end: datetime) -> list[sqlite3.Row]:
     ).fetchall()
 
 
-def event_before(dt: datetime) -> Optional[sqlite3.Row]:
+def event_before(dt: datetime, before_id: int | None = None) -> Optional[sqlite3.Row]:
+    """Остання подія строго раніше dt (для однакового часу — з меншим id)."""
+    if before_id is None:
+        return conn().execute(
+            "SELECT * FROM events WHERE ts < ? ORDER BY ts DESC, id DESC LIMIT 1", (fmt(dt),)
+        ).fetchone()
     return conn().execute(
-        "SELECT * FROM events WHERE ts < ? ORDER BY ts DESC, id DESC LIMIT 1", (fmt(dt),)
+        "SELECT * FROM events WHERE ts < ? OR (ts = ? AND id < ?) ORDER BY ts DESC, id DESC LIMIT 1",
+        (fmt(dt), fmt(dt), before_id),
+    ).fetchone()
+
+
+def event_at_or_before(dt: datetime) -> Optional[sqlite3.Row]:
+    """Подія, що визначає стан дитини в момент dt."""
+    return conn().execute(
+        "SELECT * FROM events WHERE ts <= ? ORDER BY ts DESC, id DESC LIMIT 1", (fmt(dt),)
     ).fetchone()
 
 
