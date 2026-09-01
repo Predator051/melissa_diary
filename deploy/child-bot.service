@@ -1,0 +1,38 @@
+[Unit]
+Description=Child diary Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/child_bot
+ExecStart=/home/ubuntu/child_bot/.venv/bin/python -m bot
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+# Сервер один ядро й ділиться з солвером — бот має бути другорядним
+Nice=10
+CPUWeight=20
+IOWeight=20
+MemoryMax=300M
+MemorySwapMax=0
+
+# Мінімальні привілеї
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/child_bot/data
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=child-bot
+
+[Install]
+WantedBy=multi-user.target
